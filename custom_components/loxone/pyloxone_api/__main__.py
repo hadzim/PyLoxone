@@ -18,6 +18,7 @@ from .connection import LoxoneConnection
 _LOGGER = logging.getLogger("pyloxone_api")
 _LOGGER.setLevel(logging.DEBUG)
 _LOGGER.addHandler(logging.StreamHandler())
+_LOGGER.handlers[0].setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(name)s: %(message)s'))
 # If you want to see what is going on at the websocket level, uncomment the following
 # linesW
 

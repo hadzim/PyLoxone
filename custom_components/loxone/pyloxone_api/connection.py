@@ -11,6 +11,8 @@ import json
 import logging
 import time
 import urllib
+import binascii
+import hmac
 from base64 import b64decode, b64encode
 from dataclasses import dataclass
 from queue import Queue
@@ -30,7 +32,7 @@ from Crypto.Util import Padding
 from .const import (AES_KEY_SIZE, CMD_AUTH_WITH_TOKEN, CMD_ENABLE_UPDATES,
                     CMD_GET_API_KEY, CMD_GET_KEY, CMD_GET_KEY_AND_SALT,
                     CMD_GET_PUBLIC_KEY, CMD_GET_VISUAL_PASSWD, CMD_KEEP_ALIVE,
-                    CMD_KEY_EXCHANGE, CMD_REFRESH_TOKEN,
+                    CMD_KEY_EXCHANGE, CMD_REFRESH_TOKEN, CMD_AUTHENTICATE,
                     CMD_REFRESH_TOKEN_JSON_WEB, CMD_REQUEST_TOKEN,
                     CMD_REQUEST_TOKEN_JSON_WEB, DELAY_CHECK_TOKEN_REFRESH,
                     IV_BYTES, KEEP_ALIVE_PERIOD, LOXAPPPATH, MAX_REFRESH_DELAY,
@@ -115,6 +117,7 @@ class LoxoneBaseConnection:
         self._session_key: str = ""
 
         self.miniserver_version: List[int] = []
+        self.version8: bool = False
         self.miniserver_serial: str = ""
         self.structure_file: Dict = {}
 
@@ -199,11 +202,14 @@ class LoxoneBaseConnection:
         # "jdev/sys/enc/CHG6k...A=="
         # Encrypted strings returned by the miniserver are not %encoded (even
         # if they were when sent to the miniserver )
+        _LOGGER.debug(f"Decrypting input: {command}")
         remove_text = "jdev/sys/enc/"
         enc_text = (
             command[len(remove_text) :] if command.startswith(remove_text) else command
         )
+        _LOGGER.debug(f"Decrypting text: {enc_text}, length={len(enc_text)}")
         decoded = b64decode(enc_text)
+        _LOGGER.debug(f"Decoded text: {decoded}, length={len(decoded)}")
         aes_cipher = AES.new(self._aes_key, AES.MODE_CBC, self._iv)
         decrypted = aes_cipher.decrypt(decoded)
         unpadded = Padding.unpad(decrypted, 16)
@@ -341,6 +347,9 @@ class LoxoneConnection(LoxoneBaseConnection):
                 raise
 
         async def check_refresh_token() -> NoReturn:
+            if self.version8:
+                return  
+                
             """Check if the token needs to be refreshed."""
             _LOGGER.debug(f"Start check refresh token task...")
             while True:
@@ -388,7 +397,11 @@ class LoxoneConnection(LoxoneBaseConnection):
                     _LOGGER.debug("Key changed successfully.")
                     await self._refresh_token()
 
-        await self.connection.send(f"{CMD_KEY_EXCHANGE}{self._session_key.decode()}")
+        if self.version8:
+            await self.connection.send(f"{CMD_GET_KEY}")
+        else:
+            await self.connection.send(f"{CMD_KEY_EXCHANGE}{self._session_key.decode()}")
+        
         self._recv_loop = asyncio.ensure_future(
             self._do_start_listening(callback, self.connection)
         )
@@ -490,6 +503,9 @@ class LoxoneConnection(LoxoneBaseConnection):
 
         connector = None
         try:
+
+            _LOGGER.debug("OPEN CALLED")
+
             connector = LoxoneAsyncHttpClient(
                 url=self.url,
                 username=self.username,
@@ -497,6 +513,9 @@ class LoxoneConnection(LoxoneBaseConnection):
                 scheme=self.scheme,
                 session=session,
             )
+
+            _LOGGER.debug("OPEN CALLED 2")
+
 
             for attempt in range(RECONNECT_TRIES):
                 try:
@@ -512,6 +531,8 @@ class LoxoneConnection(LoxoneBaseConnection):
                         _LOGGER.error("Max tries exceeded. Stopping.")
                         raise
 
+            _LOGGER.debug("OPEN CALLED 3")
+
             data = await api_resp.content.read()
             _value = LLResponse(data).value
             # The json returned by the miniserver is invalid. It contains " and '.
@@ -519,11 +540,18 @@ class LoxoneConnection(LoxoneBaseConnection):
             value = json.loads(_value.replace("'", '"'))
             # self.https_status = value.get("httpsStatus")
 
+            _LOGGER.debug("OPEN CALLED 4")
+
             self.miniserver_version = (
                 [int(x) for x in value.get("version").split(".")]
                 if value.get("version")
                 else []
             )
+
+            self.version8 = self.miniserver_version and self.miniserver_version[0] < 9
+
+            _LOGGER.debug(f"OPEN CALLED 5, VERSION 8 = {self.version8}")
+
             self.miniserver_serial = value.get("snr")
             local = value.get("local", True)
             if not local:
@@ -531,6 +559,9 @@ class LoxoneConnection(LoxoneBaseConnection):
                 self.url = connector.base_url.replace("https://", "").replace(
                     "http://", ""
                 )
+
+            _LOGGER.debug(f"OPEN CALLED SERIAL = {self.miniserver_serial}")
+            _LOGGER.debug(f"OPEN CALLED VERSION = {self.miniserver_version}")
 
             # Get the structure file
             try:
@@ -549,6 +580,9 @@ class LoxoneConnection(LoxoneBaseConnection):
             # Get the public key
             pk_data = await connector.get(CMD_GET_PUBLIC_KEY)
             pk_data_text = await pk_data.content.read()
+
+            
+
             pk = LLResponse(pk_data_text).value
             # Loxone returns a certificate instead of a key, and the certificate is not
             # properly PEM encoded because it does not contain newlines before/after the
@@ -556,6 +590,9 @@ class LoxoneConnection(LoxoneBaseConnection):
             # char line lengths throughout, but Python does not seem to insist on this.
             # If, for some reason, no certificate is returned, _public_key will be an
             # empty string.
+
+            _LOGGER.debug(f"OPEN CALLED PUBLIC KEY = {pk}")
+
             self._public_key = pk.replace(
                 "-----BEGIN CERTIFICATE-----", "-----BEGIN PUBLIC KEY-----\n"
             ).replace("-----END CERTIFICATE-----", "\n-----END PUBLIC KEY-----\n")
@@ -577,9 +614,14 @@ class LoxoneConnection(LoxoneBaseConnection):
         aes_key = self._aes_key.hex()
         iv = self._iv.hex()
         session_key = f"{aes_key}:{iv}".encode("utf-8")
+
+        _LOGGER.debug(f"AES256 key = {aes_key}")
+        _LOGGER.debug(f"AES256 iv  = {iv}")
+        _LOGGER.debug(f"Session key = {session_key}")
+
         try:
             self._session_key = b64encode(rsa_cipher.encrypt(session_key))
-            _LOGGER.debug("generate_session_key successfully...")
+            _LOGGER.debug(f"generate_session_key successfully: {self._session_key} length={len(self._session_key)}")
         except ValueError as exc:
             _LOGGER.error(f"Error generating session key: {exc}")
             raise LoxoneException(exc) from None
@@ -634,6 +676,22 @@ class LoxoneConnection(LoxoneBaseConnection):
 
         _LOGGER.debug("Connection closed.")
 
+    def v8_hash_credentials(self, user: str, password: str, hash_key_hex: str) -> str:
+        
+        hash_key_bytes = binascii.unhexlify(hash_key_hex)
+        
+        # HMAC-SHA1
+        mac = hmac.new(hash_key_bytes, digestmod=hashlib.sha1)
+        
+        # data = "user:password"
+        data = f"{user}:{password}".encode("utf-8")
+        mac.update(data)
+        
+        # výsledek hex
+        hex_data = binascii.hexlify(mac.digest()).decode("utf-8")
+        return hex_data
+        
+
     async def send_websocket_command(self, device_uuid: str, value: str):
         """Send a websocket command to the Miniserver."""
         command = "jdev/sps/io/{}/{}".format(device_uuid, value)
@@ -665,9 +723,33 @@ class LoxoneConnection(LoxoneBaseConnection):
             mess_obj.control = self._decrypt(mess_obj.control)
 
         if isinstance(mess_obj, TextMessage) and "keyexchange" in mess_obj.message:
-            _LOGGER.debug("Key exchange with miniserver...")
-            command = f"{CMD_GET_KEY_AND_SALT}/{self.username}"
-            self._message_queue.put(MessageForQueue(command, True))
+            
+            if self.version8:
+                _LOGGER.debug("Key exchange with miniserver v8...")
+                encKey = mess_obj.value_as_dict["value"]
+                _LOGGER.debug(f"enc - key received: {encKey}")
+                #AES Decrypt the received key with the session key
+                #self._key = self._decrypt(encKey).decode("utf-8")
+                sesKeyDecoded = b64decode(self._session_key)
+                _LOGGER.debug(f"Session key decoded: {sesKeyDecoded}, length={len(sesKeyDecoded)}")
+                decoded = b64decode(encKey)
+                _LOGGER.debug(f"Decoded text: {decoded}, length={len(decoded)}")
+                aes_cipher = AES.new(sesKeyDecoded, AES.MODE_CBC, self._iv)
+                decrypted = aes_cipher.decrypt(decoded)
+                _LOGGER.debug(f"decrypted text: {decrypted}, length={len(decrypted)}")
+                
+                
+                
+
+               
+                #command = f"{CMD_GET_KEY}/{self.username}"
+                #self._message_queue.put(MessageForQueue(command, False))
+                command = f"{CMD_GET_KEY_AND_SALT}/{self.username}"
+                self._message_queue.put(MessageForQueue(command, True))
+            else:
+                _LOGGER.debug("Key exchange with miniserver v9+...")
+                command = f"{CMD_GET_KEY_AND_SALT}/{self.username}"
+                self._message_queue.put(MessageForQueue(command, True))
 
         elif isinstance(mess_obj, TextMessage) and "getkey2" in mess_obj.message:
             _LOGGER.debug("Got get key2")
@@ -694,7 +776,18 @@ class LoxoneConnection(LoxoneBaseConnection):
 
         elif isinstance(mess_obj, TextMessage) and "getkey" in mess_obj.message:
             _LOGGER.debug("Got get getkey")
-            self._key = mess_obj.value_as_dict["value"]
+            if self.version8:
+                self._key = mess_obj.value_as_dict["value"]
+                hashed = self.v8_hash_credentials(self.username, self.password, self._key)
+                _LOGGER.debug(f"Hashed credentials: {hashed}")
+                command = f"{CMD_AUTHENTICATE}{hashed}"
+                self._message_queue.put(MessageForQueue(command, False))
+            else:   
+                self._key = mess_obj.value_as_dict["value"]
+        elif isinstance(mess_obj, TextMessage) and "authenticate" in mess_obj.message:
+            _LOGGER.debug("Authenticated v8")
+            # await self._send_text_command(f"{CMD_ENABLE_UPDATES}", encrypted=True)
+            self._message_queue.put(MessageForQueue(f"{CMD_ENABLE_UPDATES}", False))
 
         elif isinstance(mess_obj, TextMessage) and "getvisusalt" in mess_obj.message:
             self._key = mess_obj.value_as_dict["value"]
